@@ -1,0 +1,32 @@
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #1a0e04;
+  --bg-2: #2a1810;
+  --surface: #2d1d0f;
+  --border: #4a3320;
+  --gold: #f59e0b;
+  --gold-light: #fbbf24;
+  --gold-dark: #d97706;
+  --cream: #fde68a;
+  --brown: #78350f;
+  --green: #10b981;
+  --red: #ef4444;
+  --text: #fde68a;
+  --muted: #a78b5f;
+  --user-bg: #78350f;
+  --user-text: #fde68a;
+  --leo-bg: #1e3a1e;
+  --leo-text: #86efac;
+}
+
+html, body, #root {
+  height: 100%;
+  background: linear-gradient(135deg, #1a0e04 0%, #2a1810 100%);
+  color: var(--text);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 15px;
+}
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }

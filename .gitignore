@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+memory_db/
+voices/
+node_modules/
+dist/
+static/
+.claude/
+.gemini/
+*.log
+.DS_Store
