@@ -3,8 +3,6 @@ import json
 import os
 import re
 import io
-import wave
-import subprocess
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -20,10 +18,15 @@ from piper.voice import PiperVoice
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
+@app.on_event("startup")
+async def _startup():
+    await warm_up_models()
+
 VOICES_DIR = Path("./voices")
 OLLAMA_URL  = "http://localhost:11434/api/generate"
 OLLAMA_TAGS = "http://localhost:11434/api/tags"
-DEFAULT_MODEL = "mistral"
+DEFAULT_MODEL = "llama3.2:3b"
 
 SYSTEM_PROMPT = (
     "You are Leo, a cheerful golden retriever who learned to talk. "
@@ -52,6 +55,35 @@ except Exception as e:
 
 chroma = chromadb.PersistentClient(path="./memory_db")
 memory = chroma.get_or_create_collection("leo_memory")
+
+
+async def warm_up_models():
+    """Pre-load Whisper + Piper + Ollama so first request isn't a cold-start."""
+    import numpy as np
+    # Whisper: dummy 1s silence
+    try:
+        silence = np.zeros(16000, dtype=np.float32)
+        list(whisper.transcribe(silence, beam_size=1)[0])
+        print("🔥 Whisper warm")
+    except Exception as e:
+        print(f"warm whisper: {e}")
+    # Piper: one-char synthesis
+    try:
+        if voice is not None:
+            _ = tts("hi")
+            print("🔥 Piper warm")
+    except Exception as e:
+        print(f"warm piper: {e}")
+    # Ollama: tiny ping so model is loaded in VRAM
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            await c.post(OLLAMA_URL, json={
+                "model": DEFAULT_MODEL, "prompt": "hi", "stream": False,
+                "options": {"num_predict": 1}
+            })
+            print(f"🔥 Ollama {DEFAULT_MODEL} warm")
+    except Exception as e:
+        print(f"warm ollama: {e}")
 
 # Load Piper TTS model once
 print("Loading Piper TTS...")
@@ -105,12 +137,12 @@ def get_active_person(p: dict) -> dict:
     return {}
 
 
-# Patterns for name detection: "I'm X", "My name is X", "Call me X", "This is X"
+# Patterns for name detection — case-insensitive, so "my name is vishal" works too
 NAME_PATTERNS = [
-    re.compile(r"\b(?:i am|i'm|im|it's|this is)\s+([A-Z][a-zA-Z]{1,20})\b", re.I),
-    re.compile(r"\bmy name(?:'s| is)\s+([A-Z][a-zA-Z]{1,20})\b", re.I),
-    re.compile(r"\bcall me\s+([A-Z][a-zA-Z]{1,20})\b", re.I),
-    re.compile(r"\bi'm\s+([A-Z][a-zA-Z]{1,20})\b", re.I),
+    re.compile(r"\bmy name(?:'s| is)\s+([a-zA-Z]{2,20})\b", re.I),
+    re.compile(r"\bcall me\s+([a-zA-Z]{2,20})\b", re.I),
+    re.compile(r"\bthis is\s+([a-zA-Z]{2,20})\b", re.I),
+    re.compile(r"\bi(?: a|'|')m\s+([a-zA-Z]{2,20})\b", re.I),
 ]
 
 
@@ -154,6 +186,77 @@ def history_section() -> str:
     for role, msg in history:
         lines.append(f"{role}: {msg}")
     return "\n".join(lines) + "\n"
+
+
+# Cheap deterministic input cleaner — zero extra latency, no LLM call.
+# Whisper commonly mis-hears "Leo" as similar short names. Fix those in place.
+_LEO_MISHEARS = re.compile(
+    r"\b(liu|lyon|leah|leeo|leow|leyo|lio|leu|leo's?|lea|lee-?o)\b",
+    re.IGNORECASE,
+)
+
+
+def fast_correct(text: str) -> str:
+    """Quick regex-based input correction. Runs in microseconds."""
+    if not text:
+        return text
+    # Fix common misheards of the dog's name against the profile
+    p = load_profile()
+    if "Leo" in {name for name in p.get("people", {})} or True:
+        text = _LEO_MISHEARS.sub("Leo", text)
+    # Collapse common filler words at the start/end
+    text = re.sub(r"^\s*(um|uh|er|ah|hmm)[,.\s]+", "", text, flags=re.I)
+    return text.strip()
+
+
+async def input_verifier(text: str) -> str:
+    """Agent to clean up and verify the user's intent from the STT transcript."""
+    p = load_profile()
+    active_name = p.get("active", "Human")
+    
+    prompt = f"""Clean up this speech-to-text transcript. 
+The user's name is '{active_name}'.
+Fix any obvious typos or misheard names. Remove filler words. 
+Return ONLY the cleaned text, no explanation.
+
+Transcript: "{text}"
+Cleaned:"""
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(OLLAMA_URL, json={
+                "model": FAST_MODEL, "prompt": prompt, "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 100}
+            })
+            return r.json().get("response", "").strip() or text
+    except:
+        return text
+
+
+async def output_critic(response: str, context: str) -> bool:
+    """Agent to check if the response hallucinates or contradicts known facts."""
+    if not context:
+        return True # Nothing to contradict
+        
+    prompt = f"""You are a Fact-Checker for an AI dog named Leo.
+Leo said: "{response}"
+
+Context/Memory about the human:
+{context}
+
+Is Leo's response consistent with the facts? (Example: If Leo says 'You love cats' but memory says 'User hates cats', it's Hallucinating).
+Return 'YES' if accurate, 'NO' if it's a hallucination.
+Response (YES/NO):"""
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(OLLAMA_URL, json={
+                "model": FAST_MODEL, "prompt": prompt, "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 5}
+            })
+            decision = r.json().get("response", "").strip().upper()
+            return "YES" in decision
+    except:
+        return True
 
 
 async def extract_facts_background(user_msg: str, leo_msg: str):
@@ -327,21 +430,23 @@ HALLUCINATIONS = {
 }
 
 
+_WORD_RX = re.compile(r"[A-Za-z\u00C0-\u017F\u4E00-\u9FFF\u3040-\u30FF\u0900-\u097F]+")
+
+
 def looks_like_hallucination(text: str) -> bool:
     t = text.strip().lower()
     if not t:
         return True
-    if t in HALLUCINATIONS:
+    # Strip trailing punctuation, then check known ghost-phrases
+    stripped = t.rstrip(" .!?,;:").strip()
+    if stripped in HALLUCINATIONS:
         return True
-    # Allow short but common greetings/names
-    if t in {"leo", "hello", "hi", "yes", "no", "okay", "correct", "perfect"}:
-        return False
-    # Single-word or very short transcripts are often noise, but let's be more lenient
-    words = [w for w in t.split() if w.isalnum()]
-    if len(words) == 0:
-         return True
-    # Repeated single token ("you you you") = hallucination
-    if len(words) > 2 and len(set(words)) == 1:
+    # Extract alphabetic words (Latin + common unicode letter ranges)
+    words = _WORD_RX.findall(t)
+    if not words:
+        return True
+    # "you you you" repeats are classic Whisper garbage
+    if len(words) >= 3 and len(set(words)) == 1:
         return True
     return False
 
@@ -360,6 +465,11 @@ async def speak_chunk(ws: WebSocket, chunk: str):
 
 
 async def handle_text(ws: WebSocket, text: str, model: str, image_b64: str | None = None):
+    # NOTE: input_verifier disabled from hot path — it added 500-2000ms before any
+    # response could start. Deterministic cheap fixes handle common misheards
+    # (e.g. "Liu" / "Lyon" → "Leo") via fast_correct() below.
+    text = fast_correct(text)
+
     used_model = pick_model(model, bool(image_b64))
 
     # Detect explicit introductions → set active speaker
@@ -378,11 +488,18 @@ async def handle_text(ws: WebSocket, text: str, model: str, image_b64: str | Non
     print(f"[transcript] {text!r} (model={used_model}{' +vision' if image_b64 else ''})")
     await ws.send_json({"type": "transcript", "text": text})
 
-    try:
-        results = memory.query(query_texts=[text], n_results=3)
-        ctx = "\n".join(results["documents"][0]) if results["documents"][0] else ""
-    except Exception:
-        ctx = ""
+    # Skip vector search when short-term history already has context (saves ~80ms).
+    # Only do semantic lookup for fresh conversations or deep recall.
+    ctx = ""
+    if len(history) < 4:
+        try:
+            results = await asyncio.to_thread(
+                lambda: memory.query(query_texts=[text], n_results=3)
+            )
+            if results["documents"][0]:
+                ctx = "\n".join(results["documents"][0])
+        except Exception:
+            pass
 
     full = ""
     speak_buffer = ""
@@ -409,14 +526,14 @@ async def handle_text(ws: WebSocket, text: str, model: str, image_b64: str | Non
 
         # First chunk: fire as soon as we have ~8 chars or the first comma/period.
         # Everything after: wait for full sentence end.
-        min_len = 8 if not first_chunk_sent else 15
+        min_len = 5 if not first_chunk_sent else 15
         m = list(SENT_END.finditer(speak_buffer))
         if m and len(speak_buffer) >= min_len:
             end = m[-1].end()
             sent, speak_buffer = speak_buffer[:end], speak_buffer[end:]
             await tts_queue.put(sent)
             first_chunk_sent = True
-        elif not first_chunk_sent and len(speak_buffer) > 25 and "," in speak_buffer:
+        elif not first_chunk_sent and len(speak_buffer) > 15 and "," in speak_buffer:
             # Kick off the very first phrase on a comma so the user hears Leo sooner
             idx = speak_buffer.rindex(",") + 1
             sent, speak_buffer = speak_buffer[:idx], speak_buffer[idx:]
@@ -437,14 +554,29 @@ async def handle_text(ws: WebSocket, text: str, model: str, image_b64: str | Non
     history.append((speaker, text))
     history.append(("Leo", full))
 
-    # Long-term vector memory (semantic search for older context)
-    try:
-        memory.add(
-            documents=[f"{speaker}: {text}\nLeo: {full}"],
-            ids=[str(abs(hash(text[:50] + full[:30])))]
-        )
-    except Exception:
-        pass
+    # Multi-Agent Step 2: Output Critic Agent (in the background)
+    async def post_response_check():
+        is_safe = await output_critic(full, ctx)
+        if not is_safe:
+            print(f"[critic] Hallucination detected in response to: {text}")
+            # Note this failure in memory for future avoidance
+            try:
+                memory.add(
+                    documents=[f"FAILURE: Leo hallucinated here. Don't say this again: {full}"],
+                    ids=[f"fail_{abs(hash(full[:50]))}"]
+                )
+            except: pass
+        else:
+            # Safe? Log as a successful memory
+            try:
+                memory.add(
+                    documents=[f"{speaker}: {text}\nLeo: {full}"],
+                    ids=[str(abs(hash(text[:50] + full[:30])))]
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(post_response_check())
 
     # Background fact extraction — does NOT block the response
     asyncio.create_task(extract_facts_background(text, full))
@@ -480,24 +612,28 @@ async def ws_endpoint(ws: WebSocket, model: str = Query(default=DEFAULT_MODEL)):
                     f.write(audio_bytes)
                     wav_path = f.name
                 try:
+                    # Force English decode — Whisper auto-detect was misflagging real
+                    # English audio as Portuguese/Urdu and getting rejected.
                     segs, info = whisper.transcribe(
-                        wav_path, beam_size=5,
+                        wav_path, beam_size=1,
+                        language="en",
                         condition_on_previous_text=False,
                         no_speech_threshold=0.6,
                         log_prob_threshold=-1.0,
                         compression_ratio_threshold=2.4,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=500),
-                        initial_prompt="English, Hindi, Hinglish conversation.",
                     )
-                    
-                    # Only accept English and Hindi to prevent noise-induced gibberish
-                    if info.language not in {"en", "hi"}:
-                        print(f"[audio] rejected detected language: {info.language}")
-                        await ws.send_json({"type": "error", "text": "Language not recognized"})
-                        continue
+                    text = " ".join(s.text for s in segs if s.no_speech_prob < 0.7).strip()
+                    print(f"[whisper] {text!r}")
 
-                    text = " ".join(s.text for s in segs if s.no_speech_prob < 0.4).strip()
+                    # Character-set sanity check — only fires if output is mostly non-Latin
+                    if text:
+                        good = sum(1 for c in text if (
+                            c.isascii() and (c.isalpha() or c.isspace() or c in ".,!?'\"-")
+                        ) or ("\u0900" <= c <= "\u097F"))
+                        if good / len(text) < 0.5:
+                            print(f"[audio] non-latin garbage, drop: {text!r}")
+                            await ws.send_json({"type": "error", "text": "garbled"})
+                            continue
                 finally:
                     if os.path.exists(wav_path):
                         os.unlink(wav_path)

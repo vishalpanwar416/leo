@@ -94,6 +94,11 @@ export default function App() {
   }, [])
 
   const onAudioFromVAD = useCallback((buf) => {
+    // If the user starts talking, stop Leo immediately (Barge-in)
+    if (playingRef.current) {
+        console.log("✋ Barge-in detected: Interrupting Leo")
+        stopPlayback()
+    }
     setOrbState('thinking')
     // Attach current camera frame if on
     if (cameraOn) {
@@ -101,12 +106,12 @@ export default function App() {
       if (frame) sendImage(frame)
     }
     sendAudio(buf)
-  }, [sendAudio, sendImage, cameraOn, captureFrame])
+  }, [sendAudio, sendImage, cameraOn, captureFrame, stopPlayback])
 
   // ── VAD ─────────────────────────────────────────────
   const { active, recording, vol, noiseFloor, sensitivity, setSensitivity, activate } = useVAD({
     onAudioReady: onAudioFromVAD,
-    paused: isPlaying,
+    paused: false, // CONTINUOUS: Never pause the microphone
   })
 
   useEffect(() => {

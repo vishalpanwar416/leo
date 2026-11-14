@@ -1,12 +1,10 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
 
-const SILENCE_MS        = 550
-const MIN_SPEECH_MS     = 350
+const SILENCE_MS        = 280   // aggressive turn-end detection
+const MIN_SPEECH_MS     = 300
 const MAX_SPEECH_MS     = 15000
 const SPEECH_TRIGGER_N  = 4         // 200ms of sustained speech
 const NOISE_EMA_ALPHA   = 0.04
-const DEFAULT_FACTOR    = 2.5
-const DEFAULT_FLOOR     = 10
 
 // Encode Float32 PCM as a WAV ArrayBuffer
 function encodeWAV(samples, sampleRate) {
